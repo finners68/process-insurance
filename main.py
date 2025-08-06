@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main_insurance")
+logger = logging.getLogger("main")
 
 app = FastAPI()
 
