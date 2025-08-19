@@ -1,6 +1,4 @@
 import os
-import io
-import json
 import base64
 import logging
 import fitz  # PyMuPDF
@@ -16,7 +14,7 @@ logger = logging.getLogger("main_combined")
 
 app = FastAPI()
 
-# CORS (for dev/testing)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -73,90 +71,56 @@ async def process_insurance_combined(request: Request, _: None = Depends(verify_
             logger.error("❌ Failed to decode base64", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Invalid base64 file."})
 
-        # Flatten PDF to image
+        # Process PDF and upload each page as image to S3
         try:
-            logger.info("🧼 Flattening PDF...")
+            logger.info("🧼 Processing all PDF pages...")
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            page = doc.load_page(0)
-            pix = page.get_pixmap(dpi=300)
-            image_bytes = pix.tobytes("png")
+            image_keys = []
+            filename_base = os.path.splitext(original_filename)[0]
+
+            for page_number in range(len(doc)):
+                page = doc.load_page(page_number)
+                pix = page.get_pixmap(dpi=300)
+                image_bytes = pix.tobytes("png")
+
+                image_filename = f"{filename_base}-page{page_number + 1}-{uuid.uuid4()}.png"
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=image_filename,
+                    Body=image_bytes,
+                    ContentType="image/png"
+                )
+                image_keys.append(image_filename)
+                logger.info(f"☁️ Uploaded page {page_number + 1} to S3 as {image_filename}")
+
         except Exception:
-            logger.error("❌ Failed to flatten PDF", exc_info=True)
-            return JSONResponse(status_code=400, content={"error": "PDF flattening failed."})
+            logger.error("❌ Failed to flatten/upload PDF pages", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": "PDF processing failed."})
 
-        # Upload to S3
-        filename_base = os.path.splitext(original_filename)[0]
-        filename = f"{filename_base}-{uuid.uuid4()}.png"
-
+        # Run Textract generic OCR (detect_document_text) on all images
+        raw_text_pages = []
         try:
-            logger.info(f"☁️ Uploading to S3: {filename}")
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=filename,
-                Body=image_bytes,
-                ContentType="image/png"
-            )
-        except Exception:
-            logger.error("❌ S3 upload failed", exc_info=True)
-            return JSONResponse(status_code=500, content={"error": "S3 upload failed."})
+            logger.info("🧠 Running detect_document_text on all pages...")
+            for key in image_keys:
+                response = textract.detect_document_text(
+                    Document={"S3Object": {"Bucket": S3_BUCKET, "Name": key}}
+                )
+                lines = [
+                    block["Text"]
+                    for block in response.get("Blocks", [])
+                    if block["BlockType"] == "LINE"
+                ]
+                page_text = "\n".join(lines)
+                raw_text_pages.append(page_text)
 
-        # Textract: analyze_document (FORMS)
-        structured_fields = {}
-        try:
-            logger.info("🧠 Calling analyze_document...")
-            response = textract.analyze_document(
-                Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}},
-                FeatureTypes=["FORMS"]
-            )
-            blocks = response.get("Blocks", [])
-            block_map = {b["Id"]: b for b in blocks}
-
-            for block in blocks:
-                if block["BlockType"] == "KEY_VALUE_SET" and "KEY" in block.get("EntityTypes", []):
-                    key = ""
-                    val = ""
-                    for rel in block.get("Relationships", []):
-                        if rel["Type"] == "CHILD":
-                            key = " ".join([
-                                block_map[child_id]["Text"]
-                                for child_id in rel["Ids"]
-                                if block_map[child_id]["BlockType"] == "WORD"
-                            ])
-                        if rel["Type"] == "VALUE":
-                            for value_id in rel["Ids"]:
-                                value_block = block_map.get(value_id)
-                                if not value_block or "Relationships" not in value_block:
-                                    continue
-                                for child_rel in value_block["Relationships"]:
-                                    if child_rel["Type"] == "CHILD":
-                                        val = " ".join([
-                                            block_map[child_id]["Text"]
-                                            for child_id in child_rel["Ids"]
-                                            if block_map[child_id]["BlockType"] == "WORD"
-                                        ])
-                    if key and val:
-                        structured_fields[key.strip()] = val.strip()
         except Exception:
-            logger.warning("⚠️ analyze_document failed", exc_info=True)
+            logger.warning("⚠️ Textract OCR failed", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": "Textract OCR failed."})
 
-        # Textract: detect_document_text
-        raw_text = ""
-        try:
-            logger.info("📃 Calling detect_document_text...")
-            response = textract.detect_document_text(
-                Document={"S3Object": {"Bucket": S3_BUCKET, "Name": filename}}
-            )
-            lines = [
-                block["Text"]
-                for block in response.get("Blocks", [])
-                if block["BlockType"] == "LINE"
-            ]
-            raw_text = "\n".join(lines)
-        except Exception:
-            logger.warning("⚠️ detect_document_text failed", exc_info=True)
+        # Combine all pages' text
+        raw_text = "\n\n".join(raw_text_pages)
 
         return JSONResponse(status_code=200, content={
-            "structured_fields": structured_fields,
             "raw_text": raw_text
         })
 
