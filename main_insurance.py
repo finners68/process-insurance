@@ -8,13 +8,16 @@ from fastapi import FastAPI, Request, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Configure logging
+# ----------------------
+# Logging
+# ----------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main_combined")
 
+# ----------------------
+# FastAPI
+# ----------------------
 app = FastAPI()
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Required ENV vars
+# ----------------------
+# Environment / Clients
+# ----------------------
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
 AWS_REGION = os.environ.get("AWS_REGION")
@@ -33,7 +38,6 @@ API_KEY = os.environ.get("API_KEY")
 if not all([AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET, API_KEY]):
     raise EnvironmentError("Missing one or more required environment variables.")
 
-# AWS clients
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -48,13 +52,33 @@ textract = boto3.client(
     region_name=AWS_REGION,
 )
 
-# API key check
+# ----------------------
+# Auth
+# ----------------------
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
+# ----------------------
+# Helpers
+# ----------------------
+def _safe_delete_s3(keys):
+    """Best-effort delete for any remaining S3 objects."""
+    for key in keys:
+        try:
+            s3.delete_object(Bucket=S3_BUCKET, Key=key)
+            logger.info(f"🗑️ Deleted leftover S3 object: {key}")
+        except Exception:
+            logger.warning(f"⚠️ Failed to delete leftover S3 object: {key}", exc_info=True)
+
+# ----------------------
+# Route
+# ----------------------
 @app.post("/process-insurance-combined")
 async def process_insurance_combined(request: Request, _: None = Depends(verify_api_key)):
+    image_keys = []          # all uploaded page image keys
+    deleted_keys = set()     # track which keys we've deleted already
+
     try:
         body = await request.json()
         if "file" not in body or "filename" not in body:
@@ -63,7 +87,7 @@ async def process_insurance_combined(request: Request, _: None = Depends(verify_
         base64_file = body["file"]
         original_filename = body["filename"]
 
-        # Decode base64 file
+        # Decode base64
         try:
             file_bytes = base64.b64decode(base64_file)
             logger.info(f"📄 Decoded file size: {len(file_bytes)} bytes")
@@ -71,59 +95,73 @@ async def process_insurance_combined(request: Request, _: None = Depends(verify_
             logger.error("❌ Failed to decode base64", exc_info=True)
             return JSONResponse(status_code=400, content={"error": "Invalid base64 file."})
 
-        # Process PDF and upload each page as image to S3
+        # Flatten ALL pages to PNG and upload to S3
         try:
-            logger.info("🧼 Processing all PDF pages...")
+            logger.info("🧼 Flattening all PDF pages...")
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            image_keys = []
             filename_base = os.path.splitext(original_filename)[0]
+
+            if len(doc) == 0:
+                return JSONResponse(status_code=400, content={"error": "PDF has no pages."})
 
             for page_number in range(len(doc)):
                 page = doc.load_page(page_number)
                 pix = page.get_pixmap(dpi=300)
                 image_bytes = pix.tobytes("png")
 
-                image_filename = f"{filename_base}-page{page_number + 1}-{uuid.uuid4()}.png"
+                image_key = f"{filename_base}-page{page_number + 1}-{uuid.uuid4()}.png"
                 s3.put_object(
                     Bucket=S3_BUCKET,
-                    Key=image_filename,
+                    Key=image_key,
                     Body=image_bytes,
-                    ContentType="image/png"
+                    ContentType="image/png",
                 )
-                image_keys.append(image_filename)
-                logger.info(f"☁️ Uploaded page {page_number + 1} to S3 as {image_filename}")
-
+                image_keys.append(image_key)
+                logger.info(f"☁️ Uploaded page {page_number + 1}/{len(doc)} to S3 as {image_key}")
         except Exception:
             logger.error("❌ Failed to flatten/upload PDF pages", exc_info=True)
+            _safe_delete_s3([k for k in image_keys if k not in deleted_keys])
             return JSONResponse(status_code=500, content={"error": "PDF processing failed."})
 
-        # Run Textract generic OCR (detect_document_text) on all images
+        # OCR each page with generic Textract and delete file right after processing
         raw_text_pages = []
         try:
-            logger.info("🧠 Running detect_document_text on all pages...")
-            for key in image_keys:
-                response = textract.detect_document_text(
-                    Document={"S3Object": {"Bucket": S3_BUCKET, "Name": key}}
-                )
-                lines = [
-                    block["Text"]
-                    for block in response.get("Blocks", [])
-                    if block["BlockType"] == "LINE"
-                ]
-                page_text = "\n".join(lines)
-                raw_text_pages.append(page_text)
+            logger.info("🧠 Running Textract detect_document_text on all pages...")
+            for idx, key in enumerate(image_keys, start=1):
+                try:
+                    response = textract.detect_document_text(
+                        Document={"S3Object": {"Bucket": S3_BUCKET, "Name": key}}
+                    )
+                    lines = [
+                        block["Text"]
+                        for block in response.get("Blocks", [])
+                        if block["BlockType"] == "LINE"
+                    ]
+                    page_text = "\n".join(lines)
+                    raw_text_pages.append(page_text)
+                    logger.info(f"✅ OCR complete for page {idx}/{len(image_keys)}: {key}")
+                finally:
+                    # Always attempt to delete the S3 object for this page (even if OCR failed)
+                    try:
+                        s3.delete_object(Bucket=S3_BUCKET, Key=key)
+                        deleted_keys.add(key)
+                        logger.info(f"🗑️ Deleted {key} from S3 after processing")
+                    except Exception:
+                        logger.warning(f"⚠️ Failed to delete {key} from S3", exc_info=True)
 
         except Exception:
-            logger.warning("⚠️ Textract OCR failed", exc_info=True)
+            logger.error("❌ Textract OCR failed", exc_info=True)
+            # Clean up any remaining uploaded pages that weren't deleted
+            _safe_delete_s3([k for k in image_keys if k not in deleted_keys])
             return JSONResponse(status_code=500, content={"error": "Textract OCR failed."})
 
-        # Combine all pages' text
+        # Combine all pages into one string (entire document OCR)
         raw_text = "\n\n".join(raw_text_pages)
 
-        return JSONResponse(status_code=200, content={
-            "raw_text": raw_text
-        })
+        return JSONResponse(status_code=200, content={"raw_text": raw_text})
 
     except Exception:
         logger.error("🔥 Unexpected error", exc_info=True)
+        # Ensure cleanup if anything slipped through
+        _safe_delete_s3([k for k in image_keys if k not in deleted_keys])
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
